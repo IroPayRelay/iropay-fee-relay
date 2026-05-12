@@ -100,7 +100,7 @@ targeting it.
 {
   "version": 1,                  // schema version of this /info shape
   "name": "Fee Relay",            // human-readable label shown in client UI
-  "wallet": "7Euc9sKqj...",      // base58 pubkey, the relay's fee_payer
+  "wallet": "FakeP1aceho1d...",      // base58 pubkey, the relay's fee_payer
   "fees": {
     "memo":    0,                // USDC charged per kind:"memo" tx
                                   //   0 = free

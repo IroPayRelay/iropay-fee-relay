@@ -1,0 +1,51 @@
+# Copy this file to `wrangler.toml` and fill in your values.
+# DO NOT commit your filled-in wrangler.toml — it contains your RPC API
+# key. wrangler.toml is already in this folder's .gitignore.
+
+name = "my-iropay-relay"
+main = "src/index.js"
+compatibility_date = "2026-01-01"
+
+# Your Cloudflare account ID (Account Home → right sidebar → Account ID)
+account_id = "YOUR_CLOUDFLARE_ACCOUNT_ID"
+
+# Custom domain(s) where this Worker serves traffic. Cloudflare auto-creates
+# the proxied DNS records on first deploy. Remove the `routes` block to use
+# only the auto-generated `<name>.<your-subdomain>.workers.dev` URL.
+routes = [
+  { pattern = "myrelay.example.com", custom_domain = true },
+]
+
+# Keep the .workers.dev URL accessible during dev (set to false once you
+# have a custom domain and only want traffic there).
+workers_dev = true
+
+# ---- ENV VARS (NOT secrets — visible to anyone who can read wrangler.toml) ----
+[vars]
+
+# Solana RPC URL with your API key embedded. The public RPC blocks
+# Cloudflare Workers (403), so you'll need a paid/free-tier provider:
+# Helius, Triton, QuickNode, Alchemy, Syndica all work.
+HELIUS_RPC = "https://mainnet.helius-rpc.com/?api-key=YOUR_API_KEY_HERE"
+
+# Your relay's fee-payer wallet (the one that holds SOL + collects USDC fees).
+# Base58 pubkey.
+FEE_PAYER_PUBKEY = "YOUR_FEE_PAYER_PUBKEY_BASE58"
+
+# Pre-derived associated token account for (FEE_PAYER_PUBKEY, USDC mint).
+# This is where the USDC fees land. Must exist on-chain before first tx —
+# create it by sending 0.001 USDC to your fee-payer pubkey from any wallet.
+FEE_PAYER_USDC_ATA = "YOUR_FEE_PAYER_USDC_ATA_BASE58"
+
+# Mainnet USDC mint (Circle). Hardcoded across the spec.
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+
+# ---- SECRETS (set via `wrangler secret put`, NEVER in wrangler.toml) ----
+#
+# FEE_PAYER_SECRET — 128-character hex string of your fee-payer's 64-byte
+# ed25519 secret key. To convert a `solana-keygen new` JSON file to hex:
+#   node -e "console.log(Buffer.from(require('./relay-fee-payer.json')).toString('hex'))"
+# Then:
+#   wrangler secret put FEE_PAYER_SECRET
+# Paste the hex when prompted. The value never appears in this file or
+# git history.

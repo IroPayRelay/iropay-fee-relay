@@ -1,0 +1,17 @@
+# Operator's filled-in wrangler config — contains the RPC API key. NEVER commit.
+wrangler.toml
+
+# Node
+node_modules/
+package-lock.json
+yarn.lock
+
+# Cloudflare Wrangler caches
+.wrangler/
+.dev.vars
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

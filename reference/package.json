@@ -1,0 +1,17 @@
+{
+  "name": "iropay-fee-relay-reference",
+  "version": "1.0.0",
+  "description": "Reference Cloudflare Worker implementation of the IroPay fee-relay wire protocol",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "tweetnacl": "1.0.3"
+  },
+  "devDependencies": {
+    "wrangler": "latest"
+  }
+}

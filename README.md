@@ -54,7 +54,7 @@ The protocol has 2 HTTP endpoints (full spec in [`docs/spec.md`](docs/spec.md)):
 {
   "version": 1,
   "name": "My Relay",
-  "wallet": "7Euc9sKqj...",
+  "wallet": "FakeP1aceho1d...",
   "fees": {
     "memo": 0,
     "payment": { "type": "percent", "rate": 0.01, "min": 0.01 }
@@ -97,9 +97,10 @@ To stand up a working relay you'll need:
    spec §9).
 
 Implementation: write the two endpoints per the spec, deploy. ~200–400
-LOC of plumbing depending on your language. A reference Cloudflare Worker
-implementation is planned for the `reference/` directory of this repo
-(open a PR or watch the repo for updates).
+LOC of plumbing depending on your language. A working **reference
+Cloudflare Worker implementation** is available in
+[`reference/`](reference/) — clone, fill `wrangler.toml.example`, and
+`wrangler deploy`. ~1100 LOC including the SPL Token tx parser.
 
 ## Adding your relay to the IroPay client
 
@@ -135,7 +136,7 @@ accepts the v1 subset.
 This specification is in the public domain — copy it freely into your
 own repo and adapt as needed.
 
-The reference implementation (when published) will be MIT-licensed.
+The reference implementation in `reference/` is MIT-licensed (see [LICENSE](LICENSE)).
 
 ## Contact
 
