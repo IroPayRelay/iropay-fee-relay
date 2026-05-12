@@ -132,10 +132,10 @@ Variants:
 - `Cache-Control: no-store` (operators may change fees by redeploying)
 
 **Notes:**
-- `free_cancellation` was a v311-era field used when `kind:"req"` memos had
-  free cancellation tracking. With the PWA-privacy redesign that retired
-  on-chain request memos, the field is effectively unused. Safe to omit
-  or set `false`.
+- `free_cancellation` is a legacy field from when request memos lived
+  on-chain. Request state is now an off-chain concern between the
+  client and the merchant, so this field is effectively unused. Safe
+  to omit or set `false`.
 - `supported_actions` is informational. The client reads it to grey-out
   options it can't use. Both `"payment"` and `"memo"` are expected for a
   full-featured relay.
