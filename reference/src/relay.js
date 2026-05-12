@@ -80,10 +80,10 @@ export async function relayHandler(request, env, ctx) {
   if (typeof txBase64 !== 'string' || txBase64.length === 0) {
     return jsonError('tx (base64) required', 400);
   }
-  // type:"cancellation" was retired in the PWA-privacy redesign — request
-  // and cancellation events are now off-chain via dyna-url.org. We keep this
-  // 410 stub for ~30 days so any pre-v343 PWA client gets a structured error
-  // instead of a generic 400.
+  // type:"cancellation" is a deprecated type — request memos are now an
+  // off-chain concern (the client coordinates request state without
+  // touching the relay). Return 410 with a stable error code so older
+  // clients that still try this path get a structured response.
   if (type === 'cancellation') {
     return jsonError('cancellation_type_deprecated', 410);
   }
@@ -148,10 +148,9 @@ export async function relayHandler(request, env, ctx) {
     if (type === 'payment') {
       validation = validatePaymentTx(parsed, env, cfg);
     } else {
-      // type === 'memo' — restricted to kind:"backup" since the
-      // PWA-privacy redesign. validateMemoTx returns a 410 sentinel
-      // (status:410, reason:'memo_type_deprecated') for any non-backup
-      // memo, propagated to the client below.
+      // type === 'memo' — currently kind:"backup" (passkey-link) and
+      // kind:"ack" (merchant-side payment attestation). Other memo kinds
+      // return 410 + memo_type_deprecated.
       validation = validateMemoTx(parsed, env, cfg);
     }
   } catch (e) {
@@ -197,40 +196,36 @@ export async function relayHandler(request, env, ctx) {
 // ---------------------------------------------------------------------------
 
 /**
- * Validate a memo-type tx — accepts kind:"backup" (passkey-link) and
- * kind:"ack" (v347 receiver-side payment attestation). All other memo
- * kinds — including kind:"req" (PWA-privacy redesign moved request/
- * cancellation off-chain to dyna-url.org) and kind:"pay" (has its own
- * type:"payment" POST path) — return 410 + memo_type_deprecated.
+ * Validate a memo-type tx — accepts kind:"backup" (passkey-link encrypted
+ * seed backup) and kind:"ack" (merchant-side payment attestation).
+ * All other memo kinds — including kind:"pay" which has its own
+ * type:"payment" POST path — return 410 + memo_type_deprecated.
  *
- * Expected instruction layout — kind:"backup" (Settings → Link passkey):
+ * Expected instruction layout — kind:"backup":
  *   - exactly one IroPay JSON memo with kind:"backup"
- *   - one SPL Token Transfer to the relay fee-payer ATA at cfg.fees.memo
+ *   - optional SPL Token Transfer to the relay fee-payer ATA at cfg.fees.memo
  *     (omitted entirely when cfg.fees.memo === 0)
  *   - the tx may carry an additional non-IroPay memo instruction (the binary
  *     blob, base64-encoded) signed by the passkey wallet — we don't validate
  *     or care about that one. It's how the recovery scan finds the backup
  *     later via getSignaturesForAddress(passkeyPubkey).
  *
- * Expected instruction layout — kind:"ack" (v347 merchant onPaid):
+ * Expected instruction layout — kind:"ack":
  *   - exactly one IroPay JSON memo with kind:"ack"
- *   - one SPL Token Transfer to the relay fee-payer ATA at cfg.fees.memo
- *     (omitted entirely when cfg.fees.memo === 0 — current default)
+ *   - optional SPL Token Transfer to the relay fee-payer ATA at cfg.fees.memo
+ *     (omitted entirely when cfg.fees.memo === 0)
  *
  * Free-memo path (cfg.fees.memo === 0):
  *   - kind:"backup" + kind:"ack" memos bypass the fee instruction entirely.
  *   - Returns { valid, isFreeMemo: true, isBackup, isAck }.
- *   - Both 'default' and 'test' modes set memo fee = 0 — IroPay's revenue
- *     model is the payment fee, not the memo fee.
+ *   - Recommended default — the spec's revenue model is the payment fee.
  *
  * Deprecated paths (status:410, reason:'memo_type_deprecated'):
- *   - kind:"req" (off-chain via dyna-url since v343)
  *   - kind:"pay" (use type:"payment" POST instead)
  *   - any unknown kind
  *
- * Pure (sync) — no KV reads. Indirect-fees credit on payments still consults
- * CANCEL_TRACKING in relayHandler step 9, but the memo validation itself
- * stopped touching KV when checkCancellationEligibility was retired.
+ * Pure (sync) — no I/O. The function inspects the parsed tx and returns
+ * a verdict; the caller decides what to do with the response.
  */
 export function validateMemoTx(parsed, env, cfg) {
   const memoIdx = findAccountIndex(parsed, MEMO_PROGRAM_ID_B58);
@@ -255,7 +250,7 @@ export function validateMemoTx(parsed, env, cfg) {
 
   // Accept kind:"backup" and kind:"ack". Anything else gets the deprecated
   // 410 sentinel — distinct from a generic 400 so the client can surface a
-  // structured error for clients running pre-v347 / pre-v343 code.
+  // structured error code (stable across spec versions).
   const isBackup = isBackupMemo(memo);
   const isAck = isAckMemo(memo);
   if (!isBackup && !isAck) {
@@ -357,23 +352,13 @@ export function validatePaymentTx(parsed, env, cfg) {
     };
   }
 
-  // Extract reputation-tracking fields. The payer signs the SPL Token transfer,
-  // and accountKeys[1] is their pubkey (slot 0 = fee payer = relay). The
-  // request-memo signature (if present) points back to the merchant's request
-  // memo, used by the relayHandler to credit the merchant's indirect_fees
-  // via CANCEL_TRACKING. v335: lives at memo.receiver.req_memo_id (was
-  // memo.ref in v1). v353: v3 encrypted memos have NO receiver field at top
-  // level — req_memo_id is gone, the only public req anchor is `req_id`
-  // (per-request nonce) which is NOT a CANCEL_TRACKING key. So memoRef is
-  // null for v3 payments → no indirect_fees credit (privacy win — no
-  // on-chain link payment→merchant).
+  // Extract bookkeeping fields the post-submit hook in relayHandler may want
+  // to act on. The payer signs the SPL Token transfer, and accountKeys[1] is
+  // their pubkey (slot 0 = fee payer = relay).
   const payerPubkey = parsed.accountKeys[1] ? base58Encode(parsed.accountKeys[1]) : null;
   const paymentFeeUsdc = Number(requiredFeeRaw) / 1_000_000;
-  const memoRef = (memo.receiver && typeof memo.receiver.req_memo_id === 'string')
-    ? memo.receiver.req_memo_id
-    : (typeof memo.ref === 'string' ? memo.ref : null); // v1 fallback (v3: null)
 
-  return { valid: true, payerPubkey, paymentFeeUsdc, memoRef };
+  return { valid: true, payerPubkey, paymentFeeUsdc };
 }
 
 // ---------------------------------------------------------------------------

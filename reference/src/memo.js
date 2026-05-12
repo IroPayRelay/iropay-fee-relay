@@ -1,11 +1,12 @@
 // src/memo.js
-// IroPay memo schema validation — accepts v1, v2, AND v3 (encrypted) shapes.
-// MUST stay in sync with js/wallet/onchain-memo.js.
+// Memo schema validation — accepts v1, v2, and v3 (encrypted) shapes per
+// the spec doc (docs/spec.md §4).
 //
-// v353 — schema v3 introduces end-to-end encryption for kind:"pay" and
-// kind:"ack" memos. The relay never decrypts — it only validates the public
-// envelope and the presence + base64 sanity of the `enc` block. Backup memos
-// stay at v=2 (no encryption layer added).
+// Schema v3 introduces end-to-end encryption for kind:"pay" and kind:"ack"
+// memos. The relay never decrypts — it only validates the public envelope
+// and the presence + base64 sanity of the `enc` block. Backup memos stay
+// at v=2 (no encryption layer added — their payload is already encrypted
+// at the application level via the passkey-derived key).
 
 export const MEMO_VERSION = 3;
 const APP_NAME = 'iropay';
@@ -21,17 +22,15 @@ export function decodeMemoData(dataBytes) {
 }
 
 /**
- * Parse + return the IroPay memo. Accepts v1 (legacy on-chain), v2 (current
- * non-encrypted: backup, legacy pay/req/cancellation), and v3 (current
- * encrypted: pay, ack). Returns null otherwise.
+ * Parse + return the IroPay memo. Accepts v1, v2 (non-encrypted), and v3
+ * (encrypted). Returns null otherwise.
  *
  * The relay's downstream predicates (isPaymentMemo / isBackupMemo / isAckMemo)
  * only inspect `kind` — those work identically on raw v1, v2, and v3 objects,
- * so we DON'T normalize the shape here (unlike the PWA-side parseMemoFromTx).
- * Keeping the raw shape lets validatePaymentTx still inspect version-specific
- * fields without conditional ladders.
+ * so we DON'T normalize the shape here. Keeping the raw shape lets the caller
+ * inspect version-specific fields without conditional ladders.
  *
- * Validation rules (must match js/wallet/onchain-memo.js parseMemoFromTx):
+ * Validation rules:
  *   - Must be valid JSON object
  *   - obj.app === 'iropay'
  *   - obj.kind is a string
@@ -39,14 +38,6 @@ export function decodeMemoData(dataBytes) {
  *   - When v === 3 + kind in {pay, ack}: enc block present + base64-sane
  *     (n, blob_r, blob_s strings of plausible lengths). The relay still
  *     does NOT decrypt — only sanity-checks the envelope.
- *
- * Note: kind:"req" memos still parse here (this function is shape-only).
- * The relay no longer routes them anywhere — type:"memo" POSTs with a
- * non-backup/non-ack memo are rejected upstream in validateMemoTx with 410
- * (memo_type_deprecated), and type:"cancellation" POSTs are rejected at
- * the router with 410 (cancellation_type_deprecated). Only kind:"pay"
- * (payments), kind:"backup" (passkey-link backups), and kind:"ack" (v347
- * receiver-side payment attestation) drive any logic.
  */
 export function parseIroPayMemo(memoString) {
   if (typeof memoString !== 'string' || memoString.length === 0) return null;
@@ -79,8 +70,8 @@ export function parseIroPayMemo(memoString) {
  * Length bounds:
  *   - n is exactly 24 raw bytes → 32 base64 chars
  *   - blob_r / blob_s = box(plaintext, n, ...) = plaintext + 16-byte tag
- *     (NaCl box overhead). Plaintext for our schema is ≤ ~120 bytes typical;
- *     keep generous upper bounds so future plaintext additions don't break
+ *     (NaCl box overhead). Plaintext is ≤ ~120 bytes typical; keep
+ *     generous upper bounds so future plaintext additions don't break
  *     validation.
  */
 function isValidEncBlock(enc) {
@@ -119,11 +110,11 @@ export function isBackupMemo(memo) {
 }
 
 /**
- * Predicate: is this a receiver-side payment ack memo (kind:"ack", v347)?
+ * Predicate: is this a merchant-side payment-attestation memo (kind:"ack")?
  *
- * Ack memos use their own version namespace (currently v=1, native — no v0
- * history to back-translate). Like backup memos, they pay no fee on default
- * + test relays (memo fee is 0 in both modes).
+ * Ack memos are broadcast by the merchant's client after detecting an
+ * incoming payment — they record the verdict (exact / under / over) so
+ * future readers can audit the payment match.
  */
 export function isAckMemo(memo) {
   return !!memo && memo.kind === 'ack';
