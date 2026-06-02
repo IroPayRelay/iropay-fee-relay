@@ -5,8 +5,8 @@
 //
 //   "payment"  → SPL Memo (kind:"pay") + USDC transfer to recipient +
 //                USDC transfer to relay fee-payer ATA.
-//                Fee math per `cfg.fees.payment`:
-//                  - percent : max(amount * rate, min), rounded UP to 0.01
+//                Fee math per `cfg.fees.payment` (v2 — raw USDC, NO cent round-up):
+//                  - percent : max(round(amount * rate), min)
 //                  - flat    : `cfg.fees.payment.amount` EXACTLY (no min, no round-up)
 //
 //   "memo"     → SPL Memo (kind:"backup" or kind:"ack") + optional USDC
@@ -58,8 +58,6 @@ const CORS_HEADERS = {
 const TOKEN_TRANSFER_DISCRIMINATOR = 3;
 // USDC has 6 decimals — 1 USDC = 1_000_000 raw.
 const USDC_RAW_PER_UNIT = 1_000_000n;
-// 1 cent in raw USDC: 0.01 * 1e6 = 10_000.
-const ONE_CENT_RAW = 10_000n;
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -426,25 +424,32 @@ export function floatToRaw(n) {
 }
 
 /**
- * Compute the required fee in raw USDC for a payment of `amountRaw` raw USDC,
- * given the mode config.
+ * Compute the required total fee in raw USDC for a payment of `amountRaw` raw
+ * USDC, given the mode config.
  *
- * Percent fees are rounded UP to the nearest cent (0.01 USDC), matching the
- * client's display precision. Flat fees are NOT rounded — a 0.001 USDC flat
- * fee stays at exactly 1000 raw units. (Earlier versions rounded everything
- * up; that defeated the point of advertising a sub-cent flat fee.)
+ * v2 fee math (matches the spec §5 + the IroPay client byte-for-byte):
+ *   percent → feeRaw = max( round(amountRaw * rate), minRaw )   // NO cent round-up
+ *   flat    → exactly `amount` (no min, no round-up)
+ *
+ * IMPORTANT: there is NO round-up to the nearest cent. The pre-v2 reference
+ * rounded up to 0.01, which made it REJECT the current client's payments
+ * (the client sends the un-rounded fee). Sub-cent floors are honored.
+ *
+ * For a mono relay (this reference) the whole fee goes to recipients[0]. For a
+ * 2-recipient split, divide this total with splitFeeRaw() from ./fee-split.js
+ * (see docs/spec.md §5.2) and validate one transfer per non-zero cut.
  */
 export function computePaymentFeeRaw(amountRaw, cfg) {
   const p = cfg.fees.payment;
   if (p.type === 'percent') {
     const minRaw = floatToRaw(p.min);
-    // amountRaw * rate, computed via integer-ish math:
-    //   percentRaw = amountRaw * (rate * 1e9) / 1e9   (use 1e9 scale = 9 dp of precision)
+    // amountRaw * rate via integer math at 1e9 scale (9 dp of rate precision),
+    // ROUNDED to nearest (add SCALE/2 before the floor division). NOT rounded
+    // up to a cent — the result is the exact raw fee.
     const SCALE = 1_000_000_000n;
     const rateScaled = BigInt(Math.round(p.rate * Number(SCALE)));
-    const candidate = (amountRaw * rateScaled) / SCALE;
-    const feeRaw = candidate > minRaw ? candidate : minRaw;
-    return roundUpCentRaw(feeRaw);
+    const candidate = (amountRaw * rateScaled + SCALE / 2n) / SCALE;
+    return candidate > minRaw ? candidate : minRaw;
   }
   if (p.type === 'flat') {
     // Flat fees are exact — no min, no round-up. A 0.001 USDC flat fee should
@@ -452,15 +457,6 @@ export function computePaymentFeeRaw(amountRaw, cfg) {
     return floatToRaw(p.amount);
   }
   throw new Error(`Unsupported payment fee type: ${p.type}`);
-}
-
-/**
- * Round a raw USDC bigint UP to the nearest cent (10_000 raw units).
- */
-export function roundUpCentRaw(raw) {
-  const remainder = raw % ONE_CENT_RAW;
-  if (remainder === 0n) return raw;
-  return raw + (ONE_CENT_RAW - remainder);
 }
 
 // ---------------------------------------------------------------------------

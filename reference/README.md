@@ -93,16 +93,23 @@ After deployment, verify your relay works:
 # /info should return your fee schedule
 curl https://your-worker-url.example/info | jq
 
-# Expected output:
+# Expected output (v2 — fee math is raw-USDC, NO cent round-up):
 # {
-#   "version": 1,
+#   "version": 2,
 #   "name": "My Relay",
 #   "wallet": "<your fee-payer pubkey>",
-#   "fees": { "memo": 0, "payment": { "type": "percent", "rate": 0.01, "min": 0.01 } },
-#   "free_cancellation": false,
+#   "fees": { "memo": 0, "payment": {
+#     "type": "percent", "rate": 0.01, "min": 0.01,
+#     "recipients": [ { "ata": "<your USDC ATA>", "bps": 10000 } ]
+#   } },
 #   "supported_actions": ["memo", "payment"]
 # }
 ```
+
+This reference ships a **mono relay** — `recipients` has one entry (your USDC
+ATA, `bps: 10000`), so 100% of the fee is yours. To run a 2-recipient sponsor
+split, declare two entries whose `bps` sum to 10000 and validate both fee
+transfers (see `docs/spec.md` §3.1 + §5, and `src/fee-split.js`).
 
 If you see your config echoed back, the relay is live. Add it to your
 IroPay client via Settings → Fee providers → Add a fee provider, paste

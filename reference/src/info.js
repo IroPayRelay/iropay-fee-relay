@@ -19,7 +19,14 @@ export function buildInfoBody(request, env) {
 
   let payment;
   if (paymentCfg.type === 'percent') {
-    payment = { type: 'percent', rate: paymentCfg.rate, min: paymentCfg.min };
+    // v2: declare the fee recipient(s). This reference is a MONO relay — the whole
+    // fee goes to YOU (recipients[0].ata = your USDC ATA, bps 10000). To run a
+    // 2-recipient sponsor split, declare two entries whose bps sum to 10000 (see
+    // docs/spec.md §3.1 + §5) and validate both fee transfers in relay.js.
+    payment = {
+      type: 'percent', rate: paymentCfg.rate, min: paymentCfg.min,
+      recipients: [{ ata: env.FEE_PAYER_USDC_ATA, bps: 10000 }],
+    };
   } else if (paymentCfg.type === 'flat') {
     payment = { type: 'flat', amount: paymentCfg.amount };
   } else {
@@ -27,7 +34,7 @@ export function buildInfoBody(request, env) {
   }
 
   return {
-    version: 1,
+    version: 2,
     name: cfg.name,
     wallet: env.FEE_PAYER_PUBKEY,
     fees: {

@@ -1,13 +1,27 @@
-# IroPay Fee Relay — Technical Specification
+# IroPay Fee Relay — Technical Specification (v2)
 
 > Wire protocol for a fee relay compatible with IroPay clients (`iropay.com`).
 > Anyone can run a relay. The PWA discovers relays via the user's Settings →
-> Fee providers list and selects the active one for submitting transactions.
+> Payment relays list and selects the active one for submitting transactions.
 >
 > This document is the **minimal contract**. Anti-spam, reputation, rate
 > limits, captchas, and any KV / database choices are entirely up to the
-> relay operator and are NOT part of the spec. See the reference impl
-> (`relay-worker/` in the iropay/crypto-pay repo) for one production take.
+> relay operator and are NOT part of the spec.
+>
+> **What changed in v2 (2026-06-01 — "generic relays"):** `GET /info` now
+> declares its payment fee as **1 or 2 `recipients`** (an atomic fee split, e.g.
+> relay 30% + sponsor 70%), and the fee math is **raw-USDC integer, no cent
+> round-up**. A v1-style single-recipient relay (no `recipients` field) still
+> works — the client keeps a backward-compatible mono path. See §5.
+
+> **Reference implementation — public source (MIT).** A working production-grade
+> reference lives in the public GitHub repo:
+>
+>   ▶ <https://github.com/IroPayRelay/iropay-fee-relay>
+>
+> There, `reference/` is the Cloudflare-Worker relay and `docs/spec.md` is a copy
+> of this spec. Clone it, fill in `reference/wrangler.toml.example`, fund the
+> fee-payer with a little SOL, and deploy. Questions: `contact@iropay.com`.
 
 ---
 
@@ -24,11 +38,11 @@ A **fee relay** is a third party that:
 3. Co-signs the transaction in slot 0 (the user has already partial-signed
    their side as the SPL token authority).
 4. Submits the final signed transaction to a Solana RPC.
-5. Optionally charges a small USDC fee for payment transactions (the user
-   adds an SPL Token Transfer instruction sending USDC to the relay's USDC
-   ATA in the same transaction).
+5. Optionally charges a small USDC fee for payment transactions. The user
+   adds **one SPL Token Transfer per fee recipient** (1 or 2) sending USDC to
+   the recipient ATA(s) the relay declares, **in the same transaction**.
 
-Relays are **interchangeable**. The PWA exposes a "Fee providers" screen
+Relays are **interchangeable**. The PWA exposes a "Payment relays" screen
 where the user can add a new relay URL, switch active relay, or remove
 relays. A relay operator gets paid in USDC per payment txn (typical
 schedules below); memo-only txns are usually free.
@@ -65,18 +79,18 @@ schedules below); memo-only txns are usually free.
 
 Steps:
 
-1. **Discover** — Client GETs `/info` to learn the relay's fee policy and
-   fee-payer pubkey. Cached client-side.
+1. **Discover** — Client GETs `/info` to learn the relay's fee policy
+   (incl. its 1–2 fee recipients) and fee-payer pubkey. Cached client-side.
 2. **Build** — Client constructs the transaction with the relay's pubkey
-   set as `fee_payer` (slot 0). Adds the appropriate instructions
-   (memo, SPL Token Transfers). Adds itself as a signer where needed
-   (token transfer authority, optional signed-memo authority). Fetches
-   latest blockhash. Partial-signs.
+   set as `fee_payer` (slot 0). Adds the memo + the recipient transfer + the
+   fee transfer(s). Adds itself as a signer where needed (token transfer
+   authority, optional signed-memo authority). Fetches latest blockhash.
+   Partial-signs.
 3. **Submit** — Client POSTs the partially-signed transaction (base64) to
    `/relay`.
-4. **Validate + co-sign + submit** — Relay parses the tx, validates the
-   instruction shape + fee math, signs slot 0 with its fee-payer key,
-   submits to Solana RPC, returns the resulting tx signature.
+4. **Validate + co-sign + submit** — Relay parses the tx, re-derives the fee
+   split, validates the instruction shape + fee math, signs slot 0 with its
+   fee-payer key, submits to Solana RPC, returns the resulting tx signature.
 5. **Confirm** — Solana confirms ~400ms later. Client polls
    `getSignatureStatuses` (or just trusts the relay's response and
    moves on).
@@ -98,32 +112,52 @@ targeting it.
 
 ```jsonc
 {
-  "version": 1,                  // schema version of this /info shape
-  "name": "Fee Relay",            // human-readable label shown in client UI
-  "wallet": "FakeP1aceho1d...",      // base58 pubkey, the relay's fee_payer
+  "version": 2,                   // schema version of this /info shape
+  "name": "bobpay",               // human-readable label shown in client UI
+  "wallet": "7Euc9sKqj...",       // base58 pubkey, the relay's fee_payer (signs slot 0)
   "fees": {
-    "memo":    0,                // USDC charged per kind:"memo" tx
-                                  //   0 = free
-                                  //   number = flat USDC per memo
+    "memo": 0,                    // USDC charged per kind:"memo" tx
+                                  //   0 = free   |   number = flat USDC per memo
     "payment": {                  // schedule for kind:"payment" txs
       "type": "percent",          // or "flat"
-      "rate": 0.01,               // when type=percent → 1%
-      "min":  0.01                //   minimum USDC fee (e.g. 1¢)
+      "rate": 0.01,               // when type=percent → 1% of the payment amount
+      "min":  0.01,               // floor on the TOTAL fee (USDC)
+      "recipients": [             // 1 or 2 USDC fee destinations — see below
+        { "ata": "<relay USDC ATA>",   "bps": 3000, "min_usdc": 0.01 },
+        { "ata": "<sponsor USDC ATA>", "bps": 7000 }
+      ]
     }
   },
   "supported_actions": ["payment", "memo"],
-  "free_cancellation": true       // (legacy, optional — see note below)
+  "turnstile_sitekey": null       // optional public sitekey, or null / absent
 }
 ```
 
-Variants:
+**`fees.payment.recipients`** — the heart of v2. **1 or 2** entries:
+
+- `recipients[0]` is **always the relay / gas-payer** — the USDC ATA that
+  collects this relay's own cut. For a *run-your-own* relay this is just you.
+- `recipients[1]` (optional) is a **sponsor / operator** who earns a commission.
+- `bps` = share in basis points; the entries **must sum to 10000** (100%).
+- `min_usdc` (optional) = a floor on **that recipient's** cut (distinct from
+  `payment.min`, which floors the **total** fee).
+- **`recipients` is OPTIONAL.** Omit it for a 100%-to-you **mono** relay: the
+  client falls back to a single fee transfer to `wallet`'s USDC ATA. This is the
+  v1-compatible path — a legacy single-recipient relay keeps working unchanged.
+
+**Variants:**
 
 ```jsonc
-// Flat fee schedule
-"payment": { "type": "flat", "amount": 0.001 }   // 0.001 USDC per payment
+// Mono relay, 100% of the fee to you (the simplest possible relay)
+"payment": { "type": "percent", "rate": 0.01, "min": 0.01,
+             "recipients": [ { "ata": "<your USDC ATA>", "bps": 10000 } ] }
+
+// Flat fee (no split, single transfer; no recipients needed)
+"payment": { "type": "flat", "amount": 0.001 }
 
 // Free relay (operator subsidizes everything)
-"fees": { "memo": 0, "payment": { "type": "flat", "amount": 0 } }
+"payment": { "type": "percent", "rate": 0, "min": 0.002,
+             "recipients": [ { "ata": "<your USDC ATA>", "bps": 10000 } ] }
 ```
 
 **Headers:**
@@ -132,17 +166,18 @@ Variants:
 - `Cache-Control: no-store` (operators may change fees by redeploying)
 
 **Notes:**
-- `free_cancellation` is a legacy field from when request memos lived
-  on-chain. Request state is now an off-chain concern between the
-  client and the merchant, so this field is effectively unused. Safe
-  to omit or set `false`.
 - `supported_actions` is informational. The client reads it to grey-out
   options it can't use. Both `"payment"` and `"memo"` are expected for a
   full-featured relay.
-- The client uses `wallet` to construct the `fee_payer` slot 0 + the
-  recipient `ata` for the fee transfer. **If the relay's wallet doesn't
-  have a USDC ATA yet, the PWA will prepend a create-ATA instruction
-  in the transaction so the relay pays its own rent.**
+- `turnstile_sitekey` is optional. When present, the client attaches an
+  `X-Turnstile-Token` header to free flows (memos / cancellations); see §9.
+- The client uses `wallet` to construct the `fee_payer` slot 0. The fee goes
+  to the `recipients[].ata` addresses, NOT necessarily `wallet`'s ATA — though
+  for a mono relay `recipients[0].ata` IS the relay wallet's own USDC ATA.
+- **If a fee-recipient ATA doesn't exist on-chain, the PWA prepends a
+  create-ATA instruction so the relay pays its own rent**, and folds a small
+  USDC reimbursement for that rent on top of `recipients[0]`'s cut (never a
+  separate transfer, never on `recipients[1]`).
 
 ---
 
@@ -162,10 +197,10 @@ Accepts a partially-signed transaction, co-signs slot 0, submits to RPC.
 The relay distinguishes two `type` values:
 
 - `"payment"` — the user is sending USDC to a recipient. Tx has memo +
-  recipient transfer + fee transfer.
+  recipient transfer + **1 or 2** fee transfers (one per non-zero recipient cut).
 - `"memo"` — the user is broadcasting a record-keeping memo (passkey-link
-  backup, ack of received payment). Tx has 1 or 2 memo instructions and an
-  optional fee transfer.
+  backup, ack of received payment, settings backup). Tx has 1 or 2 memo
+  instructions and an optional single flat memo-fee transfer.
 
 **Response 200 / `application/json`:**
 
@@ -181,15 +216,11 @@ The relay distinguishes two `type` values:
 { "error": "Fee payer mismatch" }
 ```
 
-Or with a structured code:
-
-```json
-{ "error": "memo_type_deprecated" }
-```
-
 The client surfaces `error` to the user. Stable error codes (when used)
 let the client localize the message. Plain error strings are fine for a
-new relay.
+new relay. The client treats `Insufficient payment fee`, `Missing operator
+transfer`, and `Missing our cut transfer` as "refresh /info and retry"
+signals (it re-syncs your declared `recipients` and re-builds).
 
 **Headers:**
 - `Content-Type: application/json`
@@ -210,7 +241,7 @@ expect makes validation a closed set of checks.
 | Name              | Value                                              |
 |-------------------|----------------------------------------------------|
 | USDC mint         | `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v`     |
-| USDC decimals     | 6                                                  |
+| USDC decimals     | 6 (all fee math is in raw integer units)           |
 | SPL Memo Program  | `MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr`      |
 | Solana cluster    | mainnet-beta                                       |
 
@@ -222,18 +253,25 @@ expect makes validation a closed set of checks.
 ix[0]  SPL Memo            — JSON memo, kind:"pay" v3 (encrypted). No signers.
 ix[1]  SPL Token Transfer  — payer USDC ATA → recipient USDC ATA
                               (the payment itself; amount in raw USDC units)
-ix[2]  SPL Token Transfer  — payer USDC ATA → relay USDC ATA
-                              (the fee — amount must match the relay's fee
-                               policy from /info, see §5)
+ix[2]  SPL Token Transfer  — payer USDC ATA → recipients[0].ata
+                              (fee cut 0 — the relay's own cut)
+ix[3]  SPL Token Transfer  — payer USDC ATA → recipients[1].ata
+                              (fee cut 1 — the sponsor cut; PRESENT ONLY when
+                               cut1 > 0, see §5)
 ```
 
-If the recipient's USDC ATA doesn't exist on-chain, a create-ATA instruction
-is **prepended** at position 0 (so the actual memo moves to ix[1]). Same
-for the relay's USDC ATA — both rent the relay (slot 0).
+- There is **one fee transfer per recipient whose cut is non-zero**. A **mono**
+  relay (single recipient), OR a 2-recipient relay where the 2nd cut rounds to
+  0 (below its floor), emits **just `ix[2]`**. A 30/70-style split where both
+  cuts are non-zero emits **`ix[2]` + `ix[3]`**.
+- If the recipient's USDC ATA and/or a fee-recipient ATA doesn't exist on-chain,
+  a create-ATA instruction is **prepended** at position 0 (the memo + transfers
+  shift down accordingly). The relay (slot 0) pays that rent; the client folds a
+  USDC reimbursement on top of `recipients[0]`'s cut.
 
 **Signers:**
-- `slot 0`: the relay's fee-payer pubkey — signed BY the relay after `/relay`
-- `slot 1`: the payer's pubkey — already signed by the client (partial-sign)
+- `slot 0`: the relay's fee-payer pubkey — signed BY the relay after `/relay`.
+- `slot 1`: the payer's pubkey — already signed by the client (partial-sign).
 
 **Memo content** (`ix[0]` data is UTF-8 bytes of this JSON):
 
@@ -242,7 +280,7 @@ for the relay's USDC ATA — both rent the relay (slot 0).
   "app":  "iropay",
   "kind": "pay",
   "v":    3,
-  "amount": 2.16,                // PUBLIC — total USDC paid (top level)
+  "amount": 2.16,                 // PUBLIC — total USDC paid (top level)
   "req_id": "<8-15 base58>",      // PUBLIC, optional — request nonce
   "enc": {                        // encrypted blob (sender/receiver names,
     "n":      "<base64 24 bytes>",//   local currency amounts). NaCl box +
@@ -255,11 +293,11 @@ for the relay's USDC ATA — both rent the relay (slot 0).
 The relay **only needs to read `amount`, `kind`, and `v`** from this JSON
 to validate the tx. It does not (and cannot) read the encrypted fields.
 
-### 4.3 Memo transaction — backup (`type: "memo"`, kind: "backup"`)
+### 4.3 Memo transaction — backup (`type: "memo"`, kind: "backup")
 
-Used when the user links a passkey to their seed wallet. The encrypted seed
-is broadcast on-chain via a binary memo, findable later via
-`getSignaturesForAddress(passkeyPubkey)`.
+Used when the user links a passkey to their seed wallet, or for on-chain
+settings backups. The encrypted payload is broadcast on-chain via a binary
+memo, findable later via `getSignaturesForAddress(...)`.
 
 **Instruction layout:**
 
@@ -267,18 +305,19 @@ is broadcast on-chain via a binary memo, findable later via
 ix[0]  SPL Memo            — JSON memo, kind:"backup". Signer = owner
                               (the seed wallet) when memo fee = 0.
                               Otherwise no signer required on this memo.
-ix[1]  SPL Memo            — Binary base64 blob (the AES-GCM encrypted seed).
-                              Signer = passkey wallet (so the tx is findable
-                              via getSignaturesForAddress(passkey_pk) later).
+ix[1]  SPL Memo            — Binary base64 blob (the encrypted payload).
+                              Signer = passkey / backup wallet (so the tx is
+                              findable via getSignaturesForAddress(...) later).
 ix[2]  SPL Token Transfer  — owner USDC ATA → relay USDC ATA
-                              (memo fee — OMITTED entirely when memo fee = 0)
+                              (flat memo fee — OMITTED entirely when memo fee = 0)
 ```
 
-When `memo fee = 0` (the default for IroPay's two reference relay modes),
-`ix[2]` is removed. To keep the owner's signature attached even without a
-fee transfer, the client makes `ix[0]` a **signed memo** with the owner as
-the keys-array signer. With a fee transfer present, the owner already
-appears via the transfer authority and the JSON memo can be keyless.
+When `memo fee = 0` (the default for IroPay-owned relays), `ix[2]` is removed.
+To keep the owner's signature attached even without a fee transfer, the client
+makes `ix[0]` a **signed memo** with the owner as the keys-array signer.
+
+The memo fee, when charged, is a **single flat transfer to the relay's USDC
+ATA** — it is NOT split across `recipients` (those apply to payment fees only).
 
 **Memo content** (`ix[0]`):
 
@@ -286,31 +325,24 @@ appears via the transfer authority and the JSON memo can be keyless.
 { "app": "iropay", "kind": "backup", "v": 2 }
 ```
 
-That's it — a marker. The encrypted payload is in `ix[1]`. Schema version
-stays at 2 (passkey backups predate v3 memo encryption and use their own
-seed-encryption scheme).
+A marker — the encrypted payload is in `ix[1]`. Schema stays at v2 (backups
+use their own seed-encryption scheme, predating v3 memo encryption).
 
-**Signers:**
-- slot 0: relay
-- slot 1: owner (seed wallet)
-- slot 2: passkey wallet (signs the binary blob memo authority)
+**Signers:** slot 0 = relay, slot 1 = owner, slot 2 = passkey / backup wallet.
 
-### 4.4 Memo transaction — ack (`type: "memo"`, kind: "ack"`)
+### 4.4 Memo transaction — ack (`type: "memo"`, kind: "ack")
 
 Broadcast by a merchant's PWA after it detects a payment landing. Records
-the merchant's match verdict (`"exact"` / `"under"` / `"over"`) so future
-auditors can see the payment was acknowledged with the local-currency
-amount expected.
+the merchant's match verdict (`"exact"` / `"under"` / `"over"`).
 
 **Instruction layout:**
 
 ```
 ix[0]  SPL Memo            — JSON memo, kind:"ack" v3 (encrypted). Signer =
-                              merchant (the initiator), so the tx is
-                              findable via getSignaturesForAddress(merchant)
-                              when activity-feed enrichment runs later.
+                              merchant (the initiator), so the tx is findable
+                              via getSignaturesForAddress(merchant) later.
 ix[1]  SPL Token Transfer  — merchant USDC ATA → relay USDC ATA
-                              (memo fee — OMITTED when memo fee = 0)
+                              (flat memo fee — OMITTED when memo fee = 0)
 ```
 
 **Memo content** (`ix[0]`):
@@ -329,69 +361,69 @@ ix[1]  SPL Token Transfer  — merchant USDC ATA → relay USDC ATA
 }
 ```
 
-The relay only needs to verify `kind` is one of `{ "backup", "ack" }` (and
-optionally `v` matches an expected range). It does NOT decrypt the `enc`
-block.
+The relay only verifies `kind` is one of `{ "backup", "ack" }` (and optionally
+`v`). It does NOT decrypt the `enc` block.
 
 ---
 
-## 5. Fee policy
+## 5. Fee policy (v2 — recipient split)
 
-The relay charges a USDC fee for payment txs. Memo txs are typically free
-on IroPay's reference relays but a relay operator may charge a flat fee.
+The relay charges a USDC fee for payment txs, **split across its 1–2
+`recipients`**. Memo txs are typically free; when charged, the memo fee is a
+single flat transfer (not split). **All money math is in raw USDC units (6
+decimals, integers). There is NO cent round-up** — sub-cent floors are honored.
 
-### 5.1 Payment fee schedules
+> Source of truth: `js/payment/fee-split.js` (client) and
+> `reference/src/fee-split.js` (relay) are **byte-identical in behaviour**.
+> The relay re-derives the split and rejects any divergence.
 
-Two fee types are supported by the IroPay client. Pick one in `/info`:
-
-**Percent (with minimum):**
-
-```jsonc
-"payment": { "type": "percent", "rate": 0.01, "min": 0.01 }
-```
-
-For a payment of `amountUsdc`, the fee is:
+### 5.1 Total fee
 
 ```
-fee = max(min, amountUsdc * rate)
+amountRaw = round(amountUsdc * 1e6)        // payment size, raw units
+rate      = fees.payment.rate              // e.g. 0.01 for 1%   (0 for a free relay)
+minRaw    = round(fees.payment.min * 1e6)  // total-fee floor, raw units
+
+feeRaw    = max( round(amountRaw * rate), minRaw )
 ```
 
-The client rounds the fee UP to the nearest cent (0.01 USDC) when type
-is `"percent"` — this lets the relay verify exact-match (not approximate)
-fee amounts. The reference impl uses `roundUpCentRaw(rawAmount)` in raw
-6-decimal units to avoid float arithmetic on the validator.
+For a **flat** schedule the total fee is simply `round(amount * 1e6)`, no rate.
 
-Example: $2.16 payment, 1% fee, 1¢ min → fee = max(0.01, 0.0216) = 0.0216
-→ round up to cent = 0.03 USDC.
+### 5.2 Splitting the total across recipients
 
-**Flat:**
+```
+// 1 recipient (mono):
+cuts = [ feeRaw ]
 
-```jsonc
-"payment": { "type": "flat", "amount": 0.001 }
+// 2 recipients ( [ {bps0, min_usdc0}, {bps1} ] ):
+min0  = round(min_usdc0 * 1e6)             // recipient-0 floor, raw (0 if absent)
+cut0  = min( feeRaw, max( min0, floor(feeRaw * bps0 / 10000) ) )
+cut1  = feeRaw - cut0
+cuts  = [ cut0, cut1 ]                      // when cut1 == 0 → emit ONE transfer
 ```
 
-The fee is always `amount` regardless of payment size. No round-up.
+`recipients[0]` (the relay's own cut) is computed first and floored by its
+`min_usdc`; the remainder goes to `recipients[1]`. When the remainder is 0
+(a tiny payment where the relay's floor eats the whole fee), only **one** fee
+transfer is emitted.
 
-### 5.2 Memo fee
+### 5.3 Worked numbers (rate 1%, `recipients: [{bps:3000, min_usdc:0.01}, {bps:7000}]`)
 
-Either:
+| Payment | `feeRaw` (= max(amt·1%, min)) | split → cuts | fee transfers |
+|---------|------------------------------|--------------|---------------|
+| **5 USDC**   | max(50000, …) = `50000` (0.05) | cut0 = min(50000, max(10000, 15000)) = `15000` (0.015); cut1 = `35000` (0.035) | **two** → ix[2]=0.015 to r0, ix[3]=0.035 to r1 |
+| **0.5 USDC** | max(5000, 10000*) = `10000` (0.01) | cut0 = min(10000, max(10000, 3000)) = `10000`; cut1 = `0` | **one** → ix[2]=0.01 to r0 |
+
+\* with `payment.min = 0.01`. A relay can set a lower `min` (e.g. 0.002).
+
+### 5.4 Memo fee
 
 ```jsonc
 "memo": 0           // FREE — most relays
 "memo": 0.001       // flat USDC per memo tx (rare)
 ```
 
-When memo fee is 0, the client's tx builder OMITS the fee transfer
-instruction (`ix[2]`) from memo txs entirely (see §4.3, §4.4).
-
-### 5.3 Validating fee amounts in the relay
-
-Compute the expected fee yourself using `/info` math, then compare to the
-actual `transferAmount` in `ix[N]` (where N is the fee-transfer position).
-Reject if not exactly equal (in raw USDC units, no tolerance).
-
-If the client rounds up to the nearest cent, the relay's expected-fee
-calculation must do the same.
+When 0, the client OMITS the memo-fee transfer entirely (§4.3, §4.4).
 
 ---
 
@@ -401,34 +433,27 @@ The relay MUST check, before signing:
 
 1. **Slot 0 = the relay's fee_payer pubkey.** Otherwise reject (`Fee payer
    mismatch`).
-2. **Instruction count matches the declared `type`.** Payment = 3 (or 4
-   with create-ATA), memo = 1 or 2 (depending on memo fee).
-3. **The instructions are in the expected order.** Memo first, then
-   transfers.
-4. **All transfers use the correct mint** (USDC, see §4.1). Reject txs
-   referencing other mints — your relay isn't designed to process them.
-5. **The fee transfer amount matches your fee schedule** (see §5.3).
-6. **The fee transfer's destination is your relay's USDC ATA.** Reject
-   if it goes elsewhere.
-7. **The memo's `kind` field matches the declared `type`:**
-   - `type:"payment"` → memo kind must be `"pay"`
-   - `type:"memo"` → memo kind must be `"backup"` or `"ack"`
-8. **The memo's `app` field is `"iropay"`** (or whatever fork identifier
-   you accept).
+2. **The instructions match the declared `type` + shape.** Payment = memo +
+   recipient transfer + **1 or 2 fee transfers** (+ optional prepended
+   create-ATAs); memo = 1 or 2 memos + optional flat fee transfer.
+3. **The instructions are in the expected order.** Memo(s) first, then transfers.
+4. **All transfers use the correct mint** (USDC, §4.1). Reject other mints.
+5. **Re-derive the fee split yourself** from your `/info` (§5) and require
+   **one transfer per non-zero cut**, each to the **matching `recipients[i].ata`**,
+   with the **exact raw amount** (no tolerance). Reject if a declared cut's
+   transfer is missing (`Missing operator transfer` / `Missing our cut
+   transfer`) or any amount/destination diverges (`Insufficient payment fee`).
+6. **The memo's `kind` matches `type`:** `payment` → `"pay"`; `memo` →
+   `"backup"` or `"ack"`.
+7. **The memo's `app` field is `"iropay"`** (or your fork identifier).
 
-The relay MAY also enforce:
-- Schema version (`v`) is in an expected range — useful for forward-compat.
-- A blockhash freshness check (most RPCs reject stale blockhashes anyway).
-- Sane upper bounds on payment amounts (e.g. reject anything over $X if
-  you don't want to handle whale-size payments).
+The relay MAY also enforce: schema version range, blockhash freshness, sane
+upper bounds on payment amounts, and — if it pays rent for a create-ATA — that
+the fee covers a small reimbursement floor for that rent.
 
-The relay MUST NOT:
-- Try to decrypt the `enc` block (it can't — it doesn't have the keys).
-- Modify any instruction or memo bytes (the user's signature would invalidate).
-- Reorder instructions.
-- Add or remove instructions.
-
-The only mutation the relay performs is signing slot 0.
+The relay MUST NOT decrypt the `enc` block, modify/reorder/add/remove any
+instruction, or touch memo bytes. **The only mutation the relay performs is
+signing slot 0.**
 
 ---
 
@@ -436,13 +461,12 @@ The only mutation the relay performs is signing slot 0.
 
 After validation, the relay:
 
-1. Loads its 32-byte ed25519 secret key (kept in env / secret manager).
-2. `nacl.sign.detached(messageBytes, secretBytes)` produces a 64-byte
-   signature over the transaction's message bytes (the bytes AFTER the
-   signatures array — Solana wire format).
+1. Loads its 32-byte ed25519 secret key (env / secret manager).
+2. `nacl.sign.detached(messageBytes, secretBytes)` → 64-byte signature over the
+   transaction's message bytes (the bytes AFTER the signatures array).
 3. Splice the signature into slot 0 of the original tx bytes.
 4. Base64-encode the now-fully-signed tx.
-5. POST to a Solana RPC's `sendTransaction` method:
+5. POST to a Solana RPC's `sendTransaction`:
 
 ```jsonc
 {
@@ -451,238 +475,237 @@ After validation, the relay:
   "method":  "sendTransaction",
   "params":  [
     "<base64 signed tx>",
-    {
-      "encoding":          "base64",
-      "skipPreflight":     true,
-      "maxRetries":         0,
-      "preflightCommitment": "confirmed"
-    }
+    { "encoding": "base64", "skipPreflight": true, "maxRetries": 0,
+      "preflightCommitment": "confirmed" }
   ]
 }
 ```
 
 Notes:
-- `skipPreflight: true` is the industry standard for SPL token transfers.
-  The relay has already validated the tx shape; preflight just duplicates
-  the work and adds 1–2s of latency. Use `skipPreflight: false` only for
-  manual debugging.
-- `maxRetries: 0` is recommended — let the client retry if the tx doesn't
-  land. The relay reporting `signature` doesn't promise the tx will land;
-  the client should poll `getSignatureStatuses` for confirmation.
-- Use a reliable RPC. The reference impl uses Helius
-  (`mainnet.helius-rpc.com`). The public Solana RPC blocks Cloudflare
-  Workers (403). Triton, Quicknode, Alchemy, and Helius all work well.
+- `skipPreflight: true` is industry standard for SPL token transfers — the relay
+  already validated the shape. Use `false` only for manual debugging.
+- `maxRetries: 0` — let the client retry. Reporting `signature` doesn't promise
+  the tx lands; the client polls `getSignatureStatuses`.
+- Use a reliable RPC. The public Solana RPC blocks Cloudflare Workers (403);
+  Helius, Triton, QuickNode, Alchemy all work.
 
 ---
 
 ## 8. Error responses
 
-Return JSON with a top-level `error` field. Use HTTP status codes:
+Return JSON with a top-level `error` field. HTTP status codes:
 
 | Status | When |
 |--------|------|
-| 400 | Bad request (invalid base64, invalid type, validation failed, etc.) |
-| 410 | Deprecated type/action (e.g. legacy `cancellation` type) |
-| 500 | Relay misconfigured (missing secret, missing RPC, etc.) |
+| 400 | Bad request (invalid base64, invalid type, validation/fee-split failure) |
+| 410 | Deprecated type/action (e.g. legacy `cancellation`) |
+| 500 | Relay misconfigured (missing secret, missing RPC) |
 | 502 | Downstream RPC failed |
 | 503 | Relay temporarily unavailable |
 
 Example shapes:
 
 ```json
-{ "error": "Invalid base64 transaction" }
 { "error": "Fee payer mismatch" }
-{ "error": "Validation error: payment fee 0.01 does not match expected 0.03" }
+{ "error": "Insufficient payment fee: got 10000, need 30000" }
+{ "error": "Missing operator transfer (need recipient-1 cut 35000)" }
 { "error": "Solana submission failed: blockhash not found" }
 ```
 
-Stable error codes (when used) help the client localize:
-
-```json
-{ "error": "cancellation_type_deprecated" }
-{ "error": "memo_type_deprecated" }
-{ "error": "fee_mismatch" }
-```
+The three fee-related strings above are the ones the client recognizes as
+"re-sync /info + retry" triggers.
 
 ---
 
 ## 9. CORS
 
-The IroPay PWA runs in a browser. Your relay MUST respond to CORS preflight
-on `/relay`:
+The IroPay PWA runs in a browser. Your relay MUST answer CORS preflight on
+`/relay`:
 
 ```
-OPTIONS /relay HTTP/1.1
-Origin: https://iropay.com
-Access-Control-Request-Method: POST
-Access-Control-Request-Headers: Content-Type
-```
-
-```
-HTTP/1.1 200
+OPTIONS /relay → 200
 Access-Control-Allow-Origin: *
 Access-Control-Allow-Methods: POST, OPTIONS
-Access-Control-Allow-Headers: Content-Type
+Access-Control-Allow-Headers: Content-Type, X-Turnstile-Token
 ```
 
-And on every `GET /info` + `POST /relay` response:
-
-```
-Access-Control-Allow-Origin: *
-```
-
-If the relay sends additional request headers (e.g. an anti-bot token), add
-them to `Access-Control-Allow-Headers`.
+And send `Access-Control-Allow-Origin: *` on every `GET /info` + `POST /relay`
+response. If you declare a `turnstile_sitekey` in `/info`, also accept the
+`X-Turnstile-Token` request header (the client attaches it to free flows).
 
 ---
 
-## 10. Worked example — payment of 2.16 USDC, 1% relay
+## 10. Worked example — payment of 2.16 USDC, 1% relay with a 30/70 split
 
 **Step 1 — client GETs `/info`:**
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "name":    "My Relay",
   "wallet":  "7Euc...",
-  "fees":    { "memo": 0, "payment": { "type": "percent", "rate": 0.01, "min": 0.01 } },
+  "fees": { "memo": 0, "payment": {
+    "type": "percent", "rate": 0.01, "min": 0.01,
+    "recipients": [
+      { "ata": "RELAYata...", "bps": 3000, "min_usdc": 0.01 },
+      { "ata": "SPONSORata...", "bps": 7000 }
+    ]
+  } },
   "supported_actions": ["payment", "memo"]
 }
 ```
 
-**Step 2 — client builds the tx:**
+**Step 2 — client computes the fee (raw units, no cent round-up):**
+
+- `amountRaw = 2_160_000`
+- `feeRaw = max(round(2_160_000 × 0.01), 10_000) = max(21_600, 10_000) = 21_600` (0.0216 USDC)
+- `cut0 = min(21_600, max(10_000, floor(21_600 × 3000/10000))) = min(21_600, max(10_000, 6_480)) = 10_000` (0.01)
+- `cut1 = 21_600 − 10_000 = 11_600` (0.0116)
+
+**Step 3 — client builds the tx:**
 
 - `fee_payer` = `7Euc...`
-- ix[0]: memo `{"app":"iropay","kind":"pay","v":3,"amount":2.16,"req_id":"…","enc":{…}}`
-- ix[1]: SPL transfer payer-ATA → merchant-ATA, amount = `2.16 * 10^6 = 2_160_000` raw
-- ix[2]: SPL transfer payer-ATA → `7Euc...`-USDC-ATA, amount = `0.03 * 10^6 = 30_000`
-  raw (max(0.01, 2.16 × 0.01) = 0.0216 → round up to 0.03)
+- ix[0]: memo `{"app":"iropay","kind":"pay","v":3,"amount":2.16,…}`
+- ix[1]: SPL transfer payer-ATA → merchant-ATA, `2_160_000` raw
+- ix[2]: SPL transfer payer-ATA → `RELAYata...`, `10_000` raw (cut0)
+- ix[3]: SPL transfer payer-ATA → `SPONSORata...`, `11_600` raw (cut1)
 - payer partial-signs, serializes, base64.
 
-**Step 3 — client POSTs:**
+**Step 4 — client POSTs** `{ "tx": "AQAB...", "type": "payment" }` to `/relay`.
 
-```http
-POST /relay
-Content-Type: application/json
+**Step 5 — relay validates:** slot 0 == `7Euc...` ✓; memo `app:"iropay"`,
+`kind:"pay"` ✓; ix[1] pays merchant ✓; re-derives `feeRaw=21_600`,
+`[10_000, 11_600]` ✓; ix[2]=10_000→RELAYata ✓; ix[3]=11_600→SPONSORata ✓.
 
-{ "tx": "AQAB...", "type": "payment" }
-```
-
-**Step 4 — relay validates:**
-
-- Slot 0 == `7Euc...` ✓
-- 3 instructions (no create-ATAs needed) ✓
-- ix[0] is memo, `app:"iropay"` and `kind:"pay"` ✓
-- ix[1] transfers USDC to merchant ✓
-- ix[2] transfers `0.03 USDC` to relay's USDC ATA ✓
-- Expected fee = `max(0.01, 2.16 × 0.01) = 0.0216` → round up to 0.03 ✓
-
-**Step 5 — relay signs + submits:**
-
-```json
-{ "jsonrpc": "2.0", "id": "1", "method": "sendTransaction", "params": ["...", { "encoding": "base64", "skipPreflight": true, "maxRetries": 0 }] }
-```
-
-**Step 6 — Helius returns signature:**
-
-```json
-{ "jsonrpc": "2.0", "id": "1", "result": "5Hk7uF8YR..." }
-```
-
-**Step 7 — relay returns to client:**
+**Step 6 — relay signs slot 0, submits via `sendTransaction`, returns:**
 
 ```json
 { "signature": "5Hk7uF8YR..." }
 ```
 
+(A **mono** relay would declare `recipients: [{ata, bps:10000}]`, the client
+would emit a single fee transfer of `21_600` raw, and step 5 would expect one
+fee transfer. Everything else is identical.)
+
 ---
 
 ## 11. Reference implementation
 
-The IroPay project ships a production-grade relay in
-`relay-worker/` (Cloudflare Worker). MIT-licensed, ~700 LOC including
-anti-spam (NOT part of this spec), Turnstile, reputation, cron-driven
-auto-refill, and the validation logic above. Useful as a starting point
-or to copy specific helpers (parseTransaction, spliceFeePayerSignature,
-roundUpCentRaw).
+The IroPay project ships a production-grade relay in `reference/`
+(Cloudflare Worker). MIT-licensed, includes anti-spam (NOT part of this spec),
+Turnstile, reputation, cron-driven auto-refill, and the validation above.
 
-Files of interest:
-
-| File | What's in it |
+| File | What it does |
 |------|--------------|
-| `src/index.js`  | Request routing (`/info` GET, `/relay` POST, OPTIONS preflight) |
-| `src/info.js`   | `buildInfoBody(request, env)` — the `/info` JSON |
-| `src/relay.js`  | `relayHandler`, `validatePaymentTx`, `validateMemoTx`, `collectUsdcTransfers`, `floatToRaw`, `computePaymentFeeRaw`, `roundUpCentRaw` |
-| `src/solana.js` | `parseTransaction`, `submitToSolana`, `spliceFeePayerSignature`, ed25519 helpers |
-| `src/memo.js`   | Memo JSON parsing + kind validation |
-| `src/config.js` | Per-host fee schedule (default vs test mode) |
+| reference/src/index.js     | Routing (GET /info, POST /relay, OPTIONS preflight) |
+| reference/src/info.js      | buildInfoBody(request, env) — the v2 /info JSON |
+| reference/src/relay.js     | relayHandler, validatePaymentTx, validateMemoTx, collectUsdcTransfers |
+| reference/src/fee-split.js | computeFeeRaw, splitFeeRaw — the §5 fee math (single source of truth) |
+| reference/src/memo.js      | Memo JSON parsing + kind validation |
+| reference/src/solana.js    | parseTransaction, submitToSolana, spliceFeePayerSignature |
+| reference/src/config.js    | RELAY_CONFIG — edit your name + fee schedule here |
 
-You can host on any platform that gives you HTTPS + a secret key store:
-Cloudflare Workers, Fly, Render, Deno Deploy, AWS Lambda, a VPS with
-nginx + Node — all fine. The contract is the wire protocol, not the
-runtime.
+This reference ships a **mono relay** (100% of the fee to you). The 2-recipient
+sponsor split documented in §5 is optional — declare two recipients (bps summing
+to 10000) in your /info + validate both transfers. Host on anything with HTTPS + a secret store: Cloudflare Workers, Fly, Render,
+Deno Deploy, AWS Lambda, a VPS — all fine. The contract is the wire protocol.
+
+The client validates `/info` strictly (`js/wallet/relay-client.js →
+validateRelayInfo`) and re-derives the split (`js/payment/fee-split.js`); return
+the documented shape or your payments will be rejected.
 
 ---
 
 ## 12. Adding your relay to a client
 
-After your relay is up and responding to `/info`:
-
 1. Open IroPay (`iropay.com`) on a device.
-2. Settings → Fee providers → "Add a fee provider".
-3. Enter your relay's base URL (e.g. `https://myrelay.example.com`).
-4. The PWA fetches `/info`, validates the shape, displays your relay's
-   name + fee policy, asks the user to confirm.
+2. Settings → Payment relays → "Add custom relay".
+3. Enter your relay's base URL — `https://myrelay.example.com`, or just the
+   bare host `myrelay.example.com` (the PWA prepends `https://`), or share a
+   `https://iropay.com/?add_relay=myrelay.example.com` link.
+4. The PWA fetches `/info`, validates the shape + caps (§13), shows your relay's
+   name + fee policy, and asks the user to confirm.
 5. Tap "Add" → your relay appears in the list. Tap to make it active.
 
-From that point on, every payment + memo broadcast from that user goes
-through your relay. The user can switch back to the default IroPay relay
-or another provider at any time. The PWA never locks itself to one
-provider — that's the decentralization story.
+The user can switch back to a default IroPay relay or another provider at any
+time — the PWA never locks itself to one provider.
 
 ---
 
-## 13. Operating considerations (not part of the spec)
+## 13. Caps the client enforces (so you know what gets rejected)
 
-These are out of scope for the wire protocol but useful for operators:
+The PWA refuses to **add** a relay whose `/info` declares an abusive fee, and
+re-checks on refresh. Stay inside these or your relay won't be addable:
 
-- **SOL balance** — keep ≥ 0.05 SOL on the fee-payer wallet at all times.
-  A typical relay burns ~1¢ in SOL fees per 100 transactions; refill from
-  surplus USDC via a Jupiter swap when needed.
-- **USDC sweeps** — payment fees accumulate. Sweep to a cold wallet
-  periodically. Don't keep more than ~$50 USDC on the hot fee-payer.
-- **Monitoring** — log every accepted tx (signature, payer, amount, type)
-  + every rejection (reason, IP). Helps with debugging "my payment failed"
-  reports.
-- **Spam protection** — entirely your call. The reference impl uses
-  Cloudflare Turnstile (invisible captcha) + per-IP daily quotas + a
-  reputation system that gives "credits" to wallets that have paid you
-  before. None of this is part of the wire protocol; clients gracefully
+- **Payment rate** ≤ **2%** (`fees.payment.rate ≤ 0.02`). Flat schedules bypass
+  the percent cap (a tiny flat fee is fine).
+- **Payment floor** `fees.payment.min` ≤ **0.10 USDC** (a high `min` is a
+  back-door around the rate cap, so it's bounded).
+- **Memo fee** ≤ **0.02 USDC**.
+- `recipients`, when present, must be **1 or 2** well-formed entries with valid
+  base58 ATAs and `bps` in `[0, 10000]`.
+
+The reference relay re-asserts the same caps server-side (`buildRelayConfig →
+assertCapsOrThrow`) so a tampered record is caught both ways.
+
+---
+
+## 14. Operating considerations (not part of the spec)
+
+- **SOL balance** — keep ≥ 0.05 SOL on the fee-payer. A relay burns ~1¢ of SOL
+  per ~100 txns; refill from surplus USDC via a Jupiter swap.
+- **USDC sweeps** — fees accumulate; sweep to a cold wallet, don't hoard on the
+  hot fee-payer.
+- **Monitoring** — log accepted txns (sig, payer, amount, type) + rejections
+  (reason, IP).
+- **Spam protection** — entirely your call (Turnstile, per-IP quotas,
+  reputation). None of it is part of the wire protocol; clients gracefully
   handle whatever you reject.
-- **Open-source your relay**. Decentralization narrative is stronger when
-  multiple independent operators run interoperable software.
+- **Open-source your relay** — the decentralization narrative is stronger with
+  multiple independent operators running interoperable software.
 
 ---
 
-## 14. Schema version + future-compat
+## 15. Schema version + future-compat
 
-This spec is `version 1` (see `GET /info`). Future versions will:
+This spec is **`version 2`** (see `GET /info`). The relay declares its version;
+clients accept the documented shape.
 
-- Bump `version` in `/info` to signal new fields.
-- Keep `version 1` shape readable as a subset.
-- Allow new `type` values in `POST /relay` (relays must reject unknown
-  types with a clear 4xx).
-- Allow new `kind` values inside memos (relays don't decrypt — they only
-  check `kind` is in their allow-list).
+- **v1 → v2:** v1 declared a single fee schedule with no `recipients` and a
+  client-side cent round-up. v2 adds the 1–2 `recipients` split and removes the
+  round-up (raw-USDC integer math). A v1-style relay (no `recipients`) still
+  works via the client's mono fallback.
+- Future versions bump `version`, keep the prior shape readable as a subset,
+  allow new `type`/`kind` values (relays reject unknown ones with a clear 4xx),
+  and never silently change fee math without a version bump.
 
-Backward compat for clients: a v1 PWA talking to a v2 relay still works
-as long as the v2 relay accepts the v1 subset.
+---
+
+## 16. Interoperability with other paymasters (Kora & co.)
+
+This spec is a deliberately **minimal REST contract** (two endpoints, a
+client-computed USDC fee split). Other Solana gasless/paymaster systems exist
+with **different wire protocols** — notably **Kora**
+(<https://solana.com/docs/tools/kora>), a JSON-RPC 2.0 paymaster that lets users
+pay fees in *any* SPL token, where the **server** estimates the fee
+(`estimateTransactionFee` / `getPaymentInstruction`) and signs via
+`signAndSendTransaction`.
+
+IroPay does **not** speak the Kora protocol natively: ours is a client-computed
+REST contract with a 1–2 recipient USDC split (the split is our revenue model),
+USDC-only, with free memos — none of which maps 1:1 onto Kora. We evaluated it
+and chose not to adopt it, but the PWA's relay layer could grow a small
+**driver adapter** (`KoraDriver`) if there's real demand.
+
+**If you run a Kora node — or any other paymaster — and want it usable from
+IroPay, or want to harmonize the two protocols, email
+`contact@iropay.com`.** We're happy to look at an adapter.
 
 ---
 
 ## License
 
-The IroPay client + reference relay are MIT-licensed. This spec is
-public domain — copy it into your own repo and adapt freely.
+The IroPay client + reference relay are MIT-licensed. This spec is public
+domain — copy it into your own repo and adapt freely.
 
 Contact: contact@iropay.com
