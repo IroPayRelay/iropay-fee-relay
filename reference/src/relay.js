@@ -59,6 +59,87 @@ const TOKEN_TRANSFER_DISCRIMINATOR = 3;
 // USDC has 6 decimals — 1 USDC = 1_000_000 raw.
 const USDC_RAW_PER_UNIT = 1_000_000n;
 
+// The Associated Token Account Program — well-known constant. The PWA prepends a
+// create-ATA instruction (this program) when a recipient's USDC account doesn't
+// exist yet; the relay pays that rent. Allowed on the payment path, rejected on
+// the memo path (a backup/ack memo never creates an ATA).
+const ATA_PROGRAM_ID_B58 = 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL';
+
+// ---------------------------------------------------------------------------
+// ★ CO-SIGN SAFETY (MANDATORY — see docs/spec.md §6.1)
+//
+// The relay signs the WHOLE message (relayHandler step 6). That fee-payer
+// signature therefore authorizes ANY instruction referencing the relay's key —
+// not just paying gas. validatePaymentTx / validateMemoTx only check the FEE; so
+// WITHOUT this guard an attacker can make the relay co-sign a tx that drains its
+// OWN funds while paying a tiny honest fee that passes the fee check:
+//   - USDC drain — a Transfer / TransferChecked whose source = our fee ATA and
+//     authority = us (slot 0). (TransferChecked is invisible to a disc-3-only
+//     collector, so validatePaymentTx never even sees it.)
+//   - SOL drain  — a System-Program transfer with `from` = slot 0; the validator
+//     never enumerates System instructions.
+//
+// Two checks, both discriminator-agnostic, applied to payment AND memo:
+//   A. Program allowlist — only Memo + SPL Token + Associated-Token may appear
+//      (kills the System SOL drain + ComputeBudget griefing + exotic CPIs).
+//   B. Our fee ATA / fee-payer pubkey must NEVER be the slot-0 (acted-upon)
+//      account, nor the authority, of a Token instruction — it may ONLY be a
+//      transfer DESTINATION (kills both USDC drains + Approve/Burn/CloseAccount/
+//      SetAuthority on our ATA).
+// Run at the relayHandler chokepoint BEFORE signing. If you fork this Worker or
+// write a relay from scratch, keep this — validating only the fee leaves you
+// drainable.
+// ---------------------------------------------------------------------------
+
+const COSIGN_ALLOWED_PROGRAMS_B58 = [MEMO_PROGRAM_ID_B58, TOKEN_PROGRAM_ID_B58, ATA_PROGRAM_ID_B58];
+
+/**
+ * Refuse to co-sign any tx that abuses the relay's fee-payer signature to move
+ * value out of the relay's OWN accounts. Pure (no I/O). Discriminator-agnostic.
+ * @returns {{valid:true}|{valid:false, reason:string}}
+ */
+export function assertCosignSafe(parsed, env) {
+  let ourAtaBytes;
+  try {
+    ourAtaBytes = base58Decode(env.FEE_PAYER_USDC_ATA);
+  } catch {
+    return { valid: false, reason: 'cosign_refused: relay misconfigured (bad USDC ATA)' };
+  }
+  let relayPubkeyBytes = null;
+  try {
+    if (env.FEE_PAYER_PUBKEY) relayPubkeyBytes = base58Decode(env.FEE_PAYER_PUBKEY);
+  } catch { relayPubkeyBytes = null; }
+  const allowed = COSIGN_ALLOWED_PROGRAMS_B58.map((b) => base58Decode(b));
+  const tokenProgramBytes = base58Decode(TOKEN_PROGRAM_ID_B58);
+
+  for (const ix of parsed.instructions || []) {
+    const progBytes = parsed.accountKeys[ix.programIdIndex];
+    if (!progBytes) {
+      return { valid: false, reason: 'cosign_refused: instruction references an unknown program slot' };
+    }
+    // Guard A — program allowlist.
+    if (!allowed.some((a) => arraysEqual(a, progBytes))) {
+      return { valid: false, reason: 'cosign_refused: disallowed program in a relay-cosigned transaction' };
+    }
+    // Guard B — our fee ATA / pubkey may only be a DESTINATION, never the slot-0
+    // acted-upon account or an authority of a Token instruction.
+    if (arraysEqual(progBytes, tokenProgramBytes)) {
+      const idxs = ix.accountIndexes || [];
+      const acct0 = idxs[0] != null ? parsed.accountKeys[idxs[0]] : null;
+      if (acct0 && arraysEqual(acct0, ourAtaBytes)) {
+        return { valid: false, reason: 'cosign_refused: relay fee ATA used as a transfer source/authority' };
+      }
+      if (relayPubkeyBytes && idxs.some((i) => {
+        const a = parsed.accountKeys[i];
+        return a && arraysEqual(a, relayPubkeyBytes);
+      })) {
+        return { valid: false, reason: 'cosign_refused: relay pubkey used as a Token-instruction authority' };
+      }
+    }
+  }
+  return { valid: true };
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -119,6 +200,16 @@ export async function relayHandler(request, env, ctx) {
   }
   if (!parsed.accountKeys[0] || !arraysEqual(parsed.accountKeys[0], feePayerBytes)) {
     return jsonError('Fee payer mismatch', 400);
+  }
+
+  // 4a-bis. ★ CO-SIGN SAFETY (MANDATORY) — refuse to co-sign a tx that drains the
+  // relay's OWN accounts (USDC via a Transfer/TransferChecked sourced from our
+  // fee ATA; SOL via a non-allowlisted System-Program transfer). MUST run before
+  // signing (step 6) and covers BOTH type:"payment" and type:"memo", since the
+  // validators only inspect the FEE. See assertCosignSafe + docs/spec.md §6.1.
+  const cosignSafety = assertCosignSafe(parsed, env);
+  if (!cosignSafety.valid) {
+    return jsonError(cosignSafety.reason, 400);
   }
 
   // 4b. ANTI-SPAM HOOK — insert your protection here if needed.
@@ -253,6 +344,18 @@ export function validateMemoTx(parsed, env, cfg) {
   const isAck = isAckMemo(memo);
   if (!isBackup && !isAck) {
     return { valid: false, status: 410, reason: 'memo_type_deprecated' };
+  }
+
+  // ★ CO-SIGN SAFETY (memo path) — a backup/ack memo NEVER legitimately creates
+  // an ATA. assertCosignSafe allows the Associated-Token program (the payment
+  // path needs it to create a recipient ATA) and its Guard B only covers the
+  // Token program, so reject any Associated-Token instruction HERE — else an
+  // attacker embeds a relay-funded create-ATA in a free memo and makes the relay
+  // pay ~0.002 SOL rent per tx.
+  const ataProgramIdx = findAccountIndex(parsed, ATA_PROGRAM_ID_B58);
+  if (ataProgramIdx !== -1
+      && parsed.instructions.some((ix) => ix.programIdIndex === ataProgramIdx)) {
+    return { valid: false, reason: 'memo_tx_must_not_create_ata' };
   }
 
   // Free-memo bypass: when the mode config sets memo fee to 0, kind:"backup"

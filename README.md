@@ -7,6 +7,14 @@ selects the active one for submitting transactions.
 
 📘 **[Read the full spec → `docs/spec.md`](docs/spec.md)**
 
+> ⚠️ **Security — co-signing is dangerous.** A relay's fee-payer signature
+> authorizes *everything* in a transaction that references its key, not just
+> paying gas. A relay that validates only the *fee* can be tricked into co-signing
+> a tx that drains its own USDC or SOL. Before signing, you **MUST** run the two
+> co-sign-safety checks (program allowlist + "your fee ATA / pubkey is never a
+> Token source/authority") — see **[`docs/spec.md` §6.1](docs/spec.md)** and the
+> reference `assertCosignSafe` in [`reference/src/relay.js`](reference/src/relay.js).
+
 ## What is a fee relay?
 
 The IroPay PWA is non-custodial: users sign every Solana transaction with

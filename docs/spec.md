@@ -446,6 +446,15 @@ The relay MUST check, before signing:
 6. **The memo's `kind` matches `type`:** `payment` → `"pay"`; `memo` →
    `"backup"` or `"ack"`.
 7. **The memo's `app` field is `"iropay"`** (or your fork identifier).
+8. **★ CO-SIGN SAFETY — program allowlist.** Every instruction's program MUST be
+   one of **SPL Memo, SPL Token, Associated-Token**. Reject anything else.
+   (See "Co-sign safety" below — this is non-optional, it is what stops your SOL
+   from being drained.)
+9. **★ CO-SIGN SAFETY — your accounts are never a source.** For **every SPL Token
+   instruction**, your fee ATA (and your fee-payer pubkey) MUST NOT be the
+   **slot-0 (acted-upon) account** nor the **authority**. Your fee ATA may ONLY
+   ever be a transfer **destination**. (This is what stops your USDC from being
+   drained — see below.)
 
 The relay MAY also enforce: schema version range, blockhash freshness, sane
 upper bounds on payment amounts, and — if it pays rent for a create-ATA — that
@@ -454,6 +463,45 @@ the fee covers a small reimbursement floor for that rent.
 The relay MUST NOT decrypt the `enc` block, modify/reorder/add/remove any
 instruction, or touch memo bytes. **The only mutation the relay performs is
 signing slot 0.**
+
+### 6.1 ★ Co-sign safety (MANDATORY — read this before you write a relay)
+
+Co-signing is your entire job, and it is **dangerous**. Your fee-payer signature
+authorizes **everything in the transaction that references your key** — not just
+paying gas. A relay that validates the *fee* but not the *rest of the
+transaction* can be tricked into co-signing a tx that **drains its own funds**.
+All three attacks below pass naive fee validation by **including a small honest
+fee**, so checks 1–7 alone are NOT enough:
+
+- **Drain your USDC** — a Token `Transfer` whose **source** is your fee ATA and
+  **authority** is your fee-payer wallet (slot 0). You co-sign → your USDC ATA is
+  emptied to the attacker, who pays a tiny fee that passes the cut check.
+- **Drain your USDC, invisibly** — the same via `TransferChecked` (discriminator
+  12). A validator that only parses the legacy `Transfer` (discriminator 3) never
+  even *sees* the draining instruction.
+- **Drain your SOL** — a **System Program** transfer with `from` = slot 0 (you).
+  You co-sign → your gas tank is emptied. A fee-only validator never enumerates
+  System instructions.
+
+**The guard (checks 8 + 9 above), restated as one rule:** *the relay co-signs
+ONLY a transaction that touches the allowed programs and never moves value out of
+the relay's own accounts.*
+
+- **Check 8 (allowlist)** kills the System-Program SOL drain, Compute-Budget
+  priority-fee griefing, and any exotic CPI. IroPay clients emit **only** Memo +
+  Token + Associated-Token, so this breaks nothing legitimate.
+- **Check 9 (never-a-source)** kills both USDC drains **and** is
+  discriminator-agnostic (it inspects the account slot, not the instruction data),
+  so it also blocks `Approve` / `Burn` / `CloseAccount` / `SetAuthority` on your
+  ATA. For `Transfer`/`TransferChecked`/`Approve`/`Burn`/`CloseAccount`/
+  `SetAuthority`, the acted-upon token account is **slot 0** — your ATA there means
+  your own funds are moving under your own signature.
+
+Run both checks at a single chokepoint **before signing**, and apply them to
+**both** `type:"payment"` and `type:"memo"` (a `type:"memo"` tx must never carry
+an Associated-Token / create-ATA instruction either — otherwise an attacker makes
+you pay ATA rent for nothing). Reference implementation: **`assertCosignSafe` in
+`reference/src/relay.js`** in this repo.
 
 ---
 
